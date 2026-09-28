@@ -1,0 +1,604 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>MediaPipe Object Detection + HiveMQ</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/mqtt@5.16.0/dist/mqtt.min.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=Sarabun:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <script src="https://unpkg.com/@phosphor-icons/web"></script>
+  <style>
+    body { font-family: 'Plus Jakarta Sans', 'Sarabun', sans-serif; -webkit-tap-highlight-color: transparent; }
+    .scanner-line {
+      position: absolute; top: 0; left: 0; right: 0; height: 2px;
+      background: linear-gradient(90deg, transparent, #38bdf8, transparent);
+      box-shadow: 0 0 12px #38bdf8;
+      animation: scan 2.5s ease-in-out infinite;
+    }
+    @keyframes scan {
+      0% { top: 0%; opacity: 0; } 15% { opacity: 1; } 85% { opacity: 1; } 100% { top: 100%; opacity: 0; }
+    }
+    .custom-scrollbar::-webkit-scrollbar { width: 4px; height: 4px; }
+    .custom-scrollbar::-webkit-scrollbar-thumb { background: #475569; border-radius: 9999px; }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen flex flex-col antialiased selection:bg-cyan-500 selection:text-white">
+
+  <header class="border-b border-slate-800 bg-slate-900/80 backdrop-blur-md sticky top-0 z-40 px-4 py-3">
+    <div class="max-w-6xl mx-auto flex items-center justify-between flex-wrap gap-2">
+      <div class="flex items-center gap-3">
+        <div class="w-9 h-9 rounded-xl bg-gradient-to-tr from-amber-500 to-orange-600 flex items-center justify-center text-white shadow-lg shadow-orange-500/20">
+          <i class="ph-bold ph-car text-xl"></i>
+        </div>
+        <div>
+          <h1 class="text-base font-bold tracking-tight text-white flex items-center gap-2">
+            AI Vehicle & Car Detector
+            <span class="text-[10px] font-semibold tracking-wider uppercase px-2 py-0.5 rounded-full bg-amber-500/10 text-amber-400 border border-amber-500/20">Traffic AI</span>
+          </h1>
+          <p class="text-xs text-slate-400 hidden sm:block">MediaPipe ในเครื่อง + ส่งสัญญาณ HiveMQ (RED/YELLOW/OFF)</p>
+        </div>
+      </div>
+      <div class="flex items-center gap-2 flex-wrap">
+        <div id="modelStatusBadge" class="flex items-center gap-2 px-3 py-1 rounded-full bg-amber-500/10 border border-amber-500/20 text-amber-300 text-xs font-medium">
+          <span class="w-2 h-2 rounded-full bg-amber-400 animate-ping"></span>
+          <span id="modelStatusText">กำลังโหลดโมเดล...</span>
+        </div>
+        <div id="mqttStatusBadge" class="flex items-center gap-2 px-3 py-1 rounded-full bg-slate-800 border border-slate-700 text-slate-300 text-xs font-medium">
+          <span id="mqttStatusDot" class="w-2 h-2 rounded-full bg-slate-500"></span>
+          <span id="mqttStatusText">MQTT: กำลังเชื่อมต่อ...</span>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <main class="max-w-6xl mx-auto w-full p-3 sm:p-6 flex-1 flex flex-col gap-6">
+    <div class="flex items-center justify-between flex-wrap gap-3">
+      <div class="inline-flex p-1 bg-slate-900 rounded-xl border border-slate-800">
+        <button id="modeCameraBtn" class="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition-all bg-cyan-600 text-white shadow-md">
+          <i class="ph-bold ph-camera"></i><span>กล้องมือถือ / กล้องสด</span>
+        </button>
+        <button id="modeImageBtn" class="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition-all text-slate-400 hover:text-slate-200">
+          <i class="ph-bold ph-image"></i><span>ทดสอบภาพนิ่ง</span>
+        </button>
+      </div>
+      <div class="flex items-center gap-3 text-xs text-slate-300 bg-slate-900/60 border border-slate-800 px-3 py-1.5 rounded-xl flex-wrap">
+        <div class="flex items-center gap-1.5">
+          <i class="ph-bold ph-lightning text-amber-400 text-sm"></i>
+          <span>Inference:</span>
+          <span id="latencyDisplay" class="font-mono text-cyan-400 font-bold">- ms</span>
+        </div>
+        <span class="text-slate-700">|</span>
+        <div class="flex items-center gap-1.5">
+          <i class="ph-bold ph-car text-amber-400 text-sm"></i>
+          <span>ยานพาหนะ:</span>
+          <span id="vehicleCountDisplay" class="font-mono text-amber-400 font-bold">0</span>
+        </div>
+        <span class="text-slate-700">|</span>
+        <div class="flex items-center gap-1.5">
+          <i class="ph-bold ph-traffic-signal text-rose-400 text-sm"></i>
+          <span>ไฟ:</span>
+          <span id="trafficLightDisplay" class="font-mono font-bold text-slate-400">OFF</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+      <div class="lg:col-span-8 flex flex-col gap-4">
+        <div class="relative bg-slate-900 rounded-2xl border border-slate-800 overflow-hidden shadow-2xl flex items-center justify-center min-h-[340px] sm:min-h-[460px] max-h-[70vh]">
+          <div id="loadingOverlay" class="absolute inset-0 bg-slate-950/80 backdrop-blur-sm z-30 flex flex-col items-center justify-center gap-3 p-6 text-center">
+            <div class="w-12 h-12 border-4 border-cyan-500/20 border-t-cyan-500 rounded-full animate-spin"></div>
+            <p id="loadingDescription" class="text-sm font-medium text-slate-200">กำลังดาวน์โหลด EfficientDet-Lite0...</p>
+          </div>
+          <div id="scannerLine" class="scanner-line hidden z-10 pointer-events-none"></div>
+          <video id="webcam" playsinline autoplay muted class="w-full h-full object-contain max-h-[70vh] bg-black hidden"></video>
+          <img id="staticImage" alt="Target" class="w-full h-full object-contain max-h-[70vh] hidden select-none" crossorigin="anonymous"/>
+          <canvas id="canvasOverlay" class="absolute inset-0 w-full h-full pointer-events-none z-20"></canvas>
+          <div id="emptyCameraState" class="flex flex-col items-center justify-center p-8 text-center text-slate-500">
+            <div class="w-16 h-16 rounded-2xl bg-slate-800/80 flex items-center justify-center text-slate-400 mb-3">
+              <i class="ph-bold ph-video-camera-slash text-3xl"></i>
+            </div>
+            <h3 class="text-sm font-semibold text-slate-300 mb-1">กล้องยังไม่เปิดทำงาน</h3>
+            <button id="startCamPromptBtn" class="mt-4 px-4 py-2 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white font-medium text-xs flex items-center gap-2">
+              <i class="ph-bold ph-video-camera"></i> เปิดกล้องเลย
+            </button>
+          </div>
+        </div>
+        <div id="cameraControls" class="flex flex-wrap items-center justify-between gap-3 p-3 bg-slate-900/60 rounded-xl border border-slate-800">
+          <div class="flex items-center gap-2">
+            <button id="toggleCameraBtn" class="px-4 py-2 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-semibold flex items-center gap-2 transition disabled:opacity-50">
+              <i class="ph-bold ph-video-camera"></i><span id="toggleCamText">เปิดกล้องสด</span>
+            </button>
+            <button id="flipCameraBtn" class="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium flex items-center gap-1.5 transition hidden">
+              <i class="ph-bold ph-arrows-clockwise"></i><span>สลับกล้อง</span>
+            </button>
+          </div>
+        </div>
+        <div id="imageControls" class="hidden flex flex-col gap-3 p-3 bg-slate-900/60 rounded-xl border border-slate-800">
+          <label class="px-4 py-2 rounded-lg bg-cyan-600 hover:bg-cyan-500 cursor-pointer text-white text-xs font-semibold inline-flex items-center gap-2 w-fit">
+            <i class="ph-bold ph-upload-simple"></i><span>อัปโหลดรูปภาพ</span>
+            <input type="file" id="imageFileInput" accept="image/*" class="hidden">
+          </label>
+          <div class="grid grid-cols-3 gap-2">
+            <button class="preset-btn h-16 rounded-lg overflow-hidden border border-slate-700" data-src="https://images.unsplash.com/photo-1568605117036-5fe5e7bab0b7?w=800&auto=format&fit=crop&q=80">
+              <img src="https://images.unsplash.com/photo-1568605117036-5fe5e7bab0b7?w=200&auto=format&fit=crop&q=60" class="w-full h-full object-cover" alt="">
+            </button>
+            <button class="preset-btn h-16 rounded-lg overflow-hidden border border-slate-700" data-src="https://images.unsplash.com/photo-1506521781263-d8422e82f27a?w=800&auto=format&fit=crop&q=80">
+              <img src="https://images.unsplash.com/photo-1506521781263-d8422e82f27a?w=200&auto=format&fit=crop&q=60" class="w-full h-full object-cover" alt="">
+            </button>
+            <button class="preset-btn h-16 rounded-lg overflow-hidden border border-slate-700" data-src="https://images.unsplash.com/photo-1558981403-c5f9899a28bc?w=800&auto=format&fit=crop&q=80">
+              <img src="https://images.unsplash.com/photo-1558981403-c5f9899a28bc?w=200&auto=format&fit=crop&q=60" class="w-full h-full object-cover" alt="">
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div class="lg:col-span-4 flex flex-col gap-4">
+        <div class="bg-slate-900 rounded-2xl border border-slate-800 p-4">
+          <h2 class="text-sm font-bold text-white flex items-center gap-2 mb-3">
+            <i class="ph-bold ph-broadcast text-emerald-400"></i> HiveMQ → ESP32
+          </h2>
+          <p class="text-xs text-slate-400 mb-2">Topic: <code class="text-cyan-400">led/control</code></p>
+          <div class="grid grid-cols-3 gap-2 text-center text-xs">
+            <div id="mqttRedCard" class="p-2 rounded-xl bg-slate-800/60 border border-slate-700 opacity-50">
+              <div class="text-lg">🔴</div><div class="font-mono font-bold">RED</div><div class="text-[10px] text-slate-500">ใกล้</div>
+            </div>
+            <div id="mqttYellowCard" class="p-2 rounded-xl bg-slate-800/60 border border-slate-700 opacity-50">
+              <div class="text-lg">🟡</div><div class="font-mono font-bold">YELLOW</div><div class="text-[10px] text-slate-500">ไกล</div>
+            </div>
+            <div id="mqttOffCard" class="p-2 rounded-xl bg-slate-800/60 border border-emerald-500/40 ring-1 ring-emerald-500/30">
+              <div class="text-lg">⚫</div><div class="font-mono font-bold">OFF</div><div class="text-[10px] text-slate-500">ไม่เจอรถ</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="bg-slate-900 rounded-2xl border border-slate-800 p-4">
+          <h2 class="text-sm font-bold text-white flex items-center gap-2 mb-3"><i class="ph-bold ph-sliders text-cyan-400"></i> การตั้งค่า</h2>
+          <div class="space-y-4">
+            <div class="flex items-center justify-between p-2.5 rounded-xl bg-slate-800/80 border border-slate-700">
+              <span class="text-xs text-slate-200">โฟกัสเฉพาะยานพาหนะ (MQTT)</span>
+              <label class="relative inline-flex items-center cursor-pointer">
+                <input type="checkbox" id="vehicleOnlyToggle" checked class="sr-only peer">
+                <div class="w-9 h-5 bg-slate-700 rounded-full peer peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-amber-500 relative"></div>
+              </label>
+            </div>
+            <div>
+              <div class="flex justify-between text-xs mb-1"><span class="text-slate-300">Confidence</span><span id="threshVal" class="font-mono text-cyan-400">40%</span></div>
+              <input type="range" id="thresholdSlider" min="15" max="90" value="40" class="w-full accent-cyan-500">
+            </div>
+            <div>
+              <div class="flex justify-between text-xs mb-1"><span class="text-slate-300">Max results</span><span id="maxVal" class="font-mono text-cyan-400">15</span></div>
+              <input type="range" id="maxResultsSlider" min="1" max="25" value="15" class="w-full accent-cyan-500">
+            </div>
+            <div>
+              <div class="flex justify-between text-xs mb-1"><span class="text-slate-300">ระยะใกล้ (ขนาดกรอบ)</span><span id="nearVal" class="font-mono text-amber-400">35%</span></div>
+              <input type="range" id="nearSlider" min="20" max="60" value="35" class="w-full accent-amber-500">
+            </div>
+          </div>
+        </div>
+
+        <div class="bg-slate-900 rounded-2xl border border-slate-800 p-4">
+          <h2 class="text-xs font-bold text-white uppercase mb-3">สถิติยานพาหนะ</h2>
+          <div class="grid grid-cols-4 gap-2 text-center text-xs">
+            <div class="bg-slate-800/60 p-2 rounded-xl"><div>🚗</div><div id="countCar" class="font-bold text-amber-400">0</div></div>
+            <div class="bg-slate-800/60 p-2 rounded-xl"><div>🏍️</div><div id="countMoto" class="font-bold text-cyan-400">0</div></div>
+            <div class="bg-slate-800/60 p-2 rounded-xl"><div>🚚</div><div id="countTruck" class="font-bold text-emerald-400">0</div></div>
+            <div class="bg-slate-800/60 p-2 rounded-xl"><div>🚌</div><div id="countBus" class="font-bold text-purple-400">0</div></div>
+          </div>
+        </div>
+
+        <div class="bg-slate-900 rounded-2xl border border-slate-800 p-4 flex-1 min-h-[200px]">
+          <h2 class="text-sm font-bold text-white mb-3">วัตถุที่ตรวจจับได้</h2>
+          <div id="resultsList" class="overflow-y-auto max-h-[280px] space-y-2 custom-scrollbar text-xs text-slate-500 text-center py-8">
+            ยังไม่มีข้อมูล
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <div id="toast" class="fixed bottom-4 right-4 z-50 translate-y-20 opacity-0 transition-all duration-300 px-4 py-3 rounded-xl bg-slate-800 border border-slate-700 text-xs shadow-xl flex items-center gap-2">
+    <i id="toastIcon" class="ph-bold ph-check-circle text-emerald-400"></i>
+    <span id="toastMsg">แจ้งเตือน</span>
+  </div>
+
+  <script type="module">
+    import { ObjectDetector, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+    const MQTT_HOST = "wss://5b44b6c6c4ef4b65a63422825cfa4e4d.s1.eu.hivemq.cloud:8884/mqtt";
+    const MQTT_USER = "obecject detection";
+    const MQTT_PASS = "obecject123";
+    const MQTT_TOPIC = "led/control";
+    const MQTT_PAYLOAD_NEAR = "RED";
+    const MQTT_PAYLOAD_FAR = "YELLOW";
+    const MQTT_PAYLOAD_OFF = "OFF";
+    const NEAR_HYSTERESIS = 0.08;
+    const VEHICLE_HOLD_MS = 700;
+
+    const LEVEL_NONE = 0, LEVEL_FAR = 1, LEVEL_NEAR = 2;
+    let mqttClient = null;
+    let lastSentState = null;
+    let lastSentTime = 0;
+    let currentLevel = LEVEL_NONE;
+    let vehicleSeenAt = -Infinity;
+
+    let objectDetector = null;
+    let runningMode = "IMAGE";
+    let currentStream = null;
+    let animationFrameId = null;
+    let facingMode = "environment";
+    let isDetectingLive = false;
+    let lastVideoTime = -1;
+
+    const VEHICLE_META = {
+      car: { th: "รถยนต์", icon: "🚗", color: "#f59e0b", bg: "rgba(245, 158, 11, 0.22)" },
+      motorcycle: { th: "มอเตอร์ไซค์", icon: "🏍️", color: "#38bdf8", bg: "rgba(56, 189, 248, 0.22)" },
+      bus: { th: "รถบัส", icon: "🚌", color: "#c084fc", bg: "rgba(192, 132, 252, 0.22)" },
+      truck: { th: "รถบรรทุก", icon: "🚚", color: "#34d399", bg: "rgba(52, 211, 153, 0.22)" },
+      bicycle: { th: "จักรยาน", icon: "🚲", color: "#fb7185", bg: "rgba(251, 113, 133, 0.22)" }
+    };
+
+    const COLOR_PALETTE = [
+      { border: "#38bdf8", bg: "rgba(56, 189, 248, 0.18)" },
+      { border: "#34d399", bg: "rgba(52, 211, 153, 0.18)" },
+      { border: "#f472b6", bg: "rgba(244, 114, 182, 0.18)" }
+    ];
+
+    const webcam = document.getElementById("webcam");
+    const staticImage = document.getElementById("staticImage");
+    const canvasOverlay = document.getElementById("canvasOverlay");
+    const ctx = canvasOverlay.getContext("2d");
+    const loadingOverlay = document.getElementById("loadingOverlay");
+    const modelStatusBadge = document.getElementById("modelStatusBadge");
+    const modelStatusText = document.getElementById("modelStatusText");
+    const mqttStatusText = document.getElementById("mqttStatusText");
+    const mqttStatusDot = document.getElementById("mqttStatusDot");
+    const scannerLine = document.getElementById("scannerLine");
+    const toggleCameraBtn = document.getElementById("toggleCameraBtn");
+    const toggleCamText = document.getElementById("toggleCamText");
+    const flipCameraBtn = document.getElementById("flipCameraBtn");
+    const startCamPromptBtn = document.getElementById("startCamPromptBtn");
+    const emptyCameraState = document.getElementById("emptyCameraState");
+    const modeCameraBtn = document.getElementById("modeCameraBtn");
+    const modeImageBtn = document.getElementById("modeImageBtn");
+    const cameraControls = document.getElementById("cameraControls");
+    const imageControls = document.getElementById("imageControls");
+    const imageFileInput = document.getElementById("imageFileInput");
+    const thresholdSlider = document.getElementById("thresholdSlider");
+    const threshVal = document.getElementById("threshVal");
+    const maxResultsSlider = document.getElementById("maxResultsSlider");
+    const maxVal = document.getElementById("maxVal");
+    const nearSlider = document.getElementById("nearSlider");
+    const nearVal = document.getElementById("nearVal");
+    const vehicleOnlyToggle = document.getElementById("vehicleOnlyToggle");
+    const latencyDisplay = document.getElementById("latencyDisplay");
+    const detectedCountDisplay = document.getElementById("vehicleCountDisplay");
+    const vehicleCountDisplay = document.getElementById("vehicleCountDisplay");
+    const trafficLightDisplay = document.getElementById("trafficLightDisplay");
+    const resultsList = document.getElementById("resultsList");
+    const countCar = document.getElementById("countCar");
+    const countMoto = document.getElementById("countMoto");
+    const countTruck = document.getElementById("countTruck");
+    const countBus = document.getElementById("countBus");
+    const mqttRedCard = document.getElementById("mqttRedCard");
+    const mqttYellowCard = document.getElementById("mqttYellowCard");
+    const mqttOffCard = document.getElementById("mqttOffCard");
+
+    function getNearRatio() {
+      return parseInt(nearSlider.value, 10) / 100;
+    }
+
+    function getMetaForCategory(name) {
+      const lower = name.toLowerCase();
+      if (VEHICLE_META[lower]) {
+        return { isVehicle: true, label: `${VEHICLE_META[lower].icon} ${VEHICLE_META[lower].th}`, border: VEHICLE_META[lower].color, bg: VEHICLE_META[lower].bg, key: lower };
+      }
+      const index = Math.abs(name.split("").reduce((h, c) => c.charCodeAt(0) + ((h << 5) - h), 0)) % COLOR_PALETTE.length;
+      return { isVehicle: false, label: name, border: COLOR_PALETTE[index].border, bg: COLOR_PALETTE[index].bg, key: lower };
+    }
+
+    function showToast(message, type = "success") {
+      const toast = document.getElementById("toast");
+      document.getElementById("toastMsg").textContent = message;
+      document.getElementById("toastIcon").className = type === "error" ? "ph-bold ph-warning-circle text-rose-400" : "ph-bold ph-check-circle text-emerald-400";
+      toast.classList.remove("translate-y-20", "opacity-0");
+      setTimeout(() => toast.classList.add("translate-y-20", "opacity-0"), 3000);
+    }
+
+    function setMqttUi(text, ok) {
+      mqttStatusText.textContent = "MQTT: " + text;
+      mqttStatusDot.className = "w-2 h-2 rounded-full " + (ok ? "bg-emerald-400" : ok === false ? "bg-rose-400" : "bg-amber-400 animate-pulse");
+    }
+
+    function setupMQTT() {
+      mqttClient = mqtt.connect(MQTT_HOST, {
+        username: MQTT_USER,
+        password: MQTT_PASS,
+        protocolVersion: 5,
+        keepalive: 60,
+        clean: true,
+        reconnectPeriod: 3000,
+        will: { topic: MQTT_TOPIC, payload: MQTT_PAYLOAD_OFF, qos: 0, retain: true }
+      });
+      mqttClient.on("connect", () => { setMqttUi("เชื่อมต่อแล้ว ✓", true); lastSentState = null; });
+      mqttClient.on("reconnect", () => setMqttUi("กำลังเชื่อมต่อใหม่...", null));
+      mqttClient.on("error", (e) => setMqttUi(String(e.message || e), false));
+    }
+
+    function levelToPayload(level) {
+      if (level === LEVEL_NEAR) return MQTT_PAYLOAD_NEAR;
+      if (level === LEVEL_FAR) return MQTT_PAYLOAD_FAR;
+      return MQTT_PAYLOAD_OFF;
+    }
+
+    function updateTrafficCards(level) {
+      const off = "p-2 rounded-xl bg-slate-800/60 border border-slate-700 opacity-50";
+      const on = (c) => `p-2 rounded-xl bg-slate-800/60 border ring-1 opacity-100 ${c}`;
+      mqttRedCard.className = level === LEVEL_NEAR ? on("border-rose-500/50 ring-rose-500/40") : off;
+      mqttYellowCard.className = level === LEVEL_FAR ? on("border-amber-500/50 ring-amber-500/40") : off;
+      mqttOffCard.className = level === LEVEL_NONE ? on("border-emerald-500/40 ring-emerald-500/30") : off;
+      trafficLightDisplay.textContent = level === LEVEL_NEAR ? "RED" : level === LEVEL_FAR ? "YELLOW" : "OFF";
+      trafficLightDisplay.className = "font-mono font-bold " + (level === LEVEL_NEAR ? "text-rose-400" : level === LEVEL_FAR ? "text-amber-400" : "text-slate-400");
+    }
+
+    function sendMqttAlert(level) {
+      const payload = levelToPayload(level);
+      const now = Date.now();
+      if (payload !== lastSentState && now - lastSentTime > 800) {
+        if (mqttClient?.connected) {
+          mqttClient.publish(MQTT_TOPIC, payload, { qos: 0, retain: true });
+          lastSentState = payload;
+          lastSentTime = now;
+        }
+      }
+      updateTrafficCards(level);
+    }
+
+    function forceSendOff() {
+      currentLevel = LEVEL_NONE;
+      if (mqttClient?.connected) mqttClient.publish(MQTT_TOPIC, MQTT_PAYLOAD_OFF, { qos: 0, retain: true });
+      updateTrafficCards(LEVEL_NONE);
+    }
+
+    function computeTrafficLevel(rawDetections, sourceWidth, sourceHeight) {
+      const nearRatio = getNearRatio();
+      let maxClose = -1;
+      let vehicles = 0;
+      for (const det of rawDetections || []) {
+        if (!det.categories?.length) continue;
+        const key = det.categories[0].categoryName.toLowerCase();
+        if (!VEHICLE_META[key]) continue;
+        vehicles++;
+        const { width, height } = det.boundingBox;
+        const c = Math.max(width / sourceWidth, height / sourceHeight);
+        if (c > maxClose) maxClose = c;
+      }
+      const now = performance.now();
+      if (vehicles === 0) {
+        if (now - vehicleSeenAt > VEHICLE_HOLD_MS) currentLevel = LEVEL_NONE;
+      } else {
+        vehicleSeenAt = now;
+        if (currentLevel === LEVEL_NEAR) {
+          if (maxClose < nearRatio - NEAR_HYSTERESIS) currentLevel = LEVEL_FAR;
+        } else {
+          currentLevel = maxClose >= nearRatio ? LEVEL_NEAR : LEVEL_FAR;
+        }
+      }
+      sendMqttAlert(currentLevel);
+      return currentLevel;
+    }
+
+    async function initDetector(mode = "VIDEO") {
+      try {
+        modelStatusText.textContent = "กำลังโหลดโมเดล...";
+        const vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+        const opts = {
+          baseOptions: {
+            modelAssetPath: "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite",
+            delegate: "GPU"
+          },
+          scoreThreshold: parseFloat(thresholdSlider.value) / 100,
+          maxResults: parseInt(maxResultsSlider.value, 10),
+          runningMode: mode
+        };
+        try {
+          objectDetector = await ObjectDetector.createFromOptions(vision, opts);
+          modelStatusText.textContent = "พร้อม (GPU)";
+        } catch {
+          opts.baseOptions.delegate = "CPU";
+          objectDetector = await ObjectDetector.createFromOptions(vision, opts);
+          modelStatusText.textContent = "พร้อม (CPU)";
+        }
+        runningMode = mode;
+        modelStatusBadge.className = "flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-500/10 border border-emerald-500/20 text-emerald-300 text-xs font-medium";
+        loadingOverlay.classList.add("hidden");
+        return true;
+      } catch (err) {
+        console.error(err);
+        modelStatusText.textContent = "โหลดโมเดลไม่สำเร็จ";
+        showToast("โหลด MediaPipe ไม่ได้ — ต้องมีอินเทอร์เน็ต", "error");
+        loadingOverlay.classList.add("hidden");
+        return false;
+      }
+    }
+
+    function renderDetections(rawDetections, sourceWidth, sourceHeight) {
+      const rect = canvasOverlay.getBoundingClientRect();
+      canvasOverlay.width = rect.width;
+      canvasOverlay.height = rect.height;
+      const scaleX = rect.width / sourceWidth;
+      const scaleY = rect.height / sourceHeight;
+      ctx.clearRect(0, 0, rect.width, rect.height);
+
+      const isVehicleOnly = vehicleOnlyToggle.checked;
+      computeTrafficLevel(rawDetections, sourceWidth, sourceHeight);
+
+      const detections = (rawDetections || []).filter((det) => {
+        if (!det.categories?.length) return false;
+        const n = det.categories[0].categoryName.toLowerCase();
+        return isVehicleOnly ? !!VEHICLE_META[n] : true;
+      });
+
+      let carCount = 0, motoCount = 0, truckCount = 0, busCount = 0, totalVehicles = 0;
+      resultsList.innerHTML = "";
+
+      if (!detections.length) {
+        vehicleCountDisplay.textContent = "0";
+        countCar.textContent = countMoto.textContent = countTruck.textContent = countBus.textContent = "0";
+        resultsList.innerHTML = '<p class="py-8">ไม่พบวัตถุในเฟรมนี้</p>';
+        return;
+      }
+
+      vehicleCountDisplay.textContent = String(detections.filter(d => VEHICLE_META[d.categories[0].categoryName.toLowerCase()]).length);
+
+      detections.forEach((detection) => {
+        let { originX, originY, width, height } = detection.boundingBox;
+        originX *= scaleX; originY *= scaleY; width *= scaleX; height *= scaleY;
+        const category = detection.categories[0];
+        const score = Math.round(category.score * 100);
+        const meta = getMetaForCategory(category.categoryName);
+        if (meta.key === "car") carCount++;
+        else if (meta.key === "motorcycle") motoCount++;
+        else if (meta.key === "truck") truckCount++;
+        else if (meta.key === "bus") busCount++;
+        if (meta.isVehicle) totalVehicles++;
+
+        ctx.strokeStyle = meta.border;
+        ctx.lineWidth = Math.max(2, rect.width / 280);
+        ctx.fillStyle = meta.bg;
+        ctx.beginPath();
+        ctx.roundRect(originX, originY, width, height, 8);
+        ctx.fill();
+        ctx.stroke();
+
+        const labelText = `${meta.label} ${score}%`;
+        const fontSize = Math.max(11, rect.width / 52);
+        ctx.font = `600 ${fontSize}px Sarabun, sans-serif`;
+        const tw = ctx.measureText(labelText).width;
+        const lh = fontSize * 1.3;
+        ctx.fillStyle = meta.border;
+        ctx.fillRect(originX, Math.max(0, originY - lh), tw + 10, lh);
+        ctx.fillStyle = "#0f172a";
+        ctx.fillText(labelText, originX + 5, originY - 4);
+
+        const li = document.createElement("div");
+        li.className = "flex justify-between p-2 rounded-lg bg-slate-800/60 border border-slate-700 text-left";
+        li.innerHTML = `<span>${meta.label}</span><span class="font-mono">${score}%</span>`;
+        resultsList.appendChild(li);
+      });
+
+      countCar.textContent = carCount;
+      countMoto.textContent = motoCount;
+      countTruck.textContent = truckCount;
+      countBus.textContent = busCount;
+    }
+
+    async function predictWebcam() {
+      if (!isDetectingLive || !objectDetector) return;
+      if (webcam.currentTime !== lastVideoTime && webcam.readyState >= 2) {
+        lastVideoTime = webcam.currentTime;
+        const t0 = performance.now();
+        try {
+          const detections = objectDetector.detectForVideo(webcam, t0);
+          latencyDisplay.textContent = `${Math.round(performance.now() - t0)} ms`;
+          renderDetections(detections.detections, webcam.videoWidth, webcam.videoHeight);
+        } catch (e) { console.error(e); }
+      }
+      animationFrameId = requestAnimationFrame(predictWebcam);
+    }
+
+    async function startCamera() {
+      try {
+        if (runningMode !== "VIDEO") await initDetector("VIDEO");
+        if (currentStream) currentStream.getTracks().forEach(t => t.stop());
+        currentStream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode, width: { ideal: 1280 }, height: { ideal: 720 } },
+          audio: false
+        });
+        webcam.srcObject = currentStream;
+        await new Promise(r => { webcam.onloadedmetadata = r; });
+        webcam.classList.remove("hidden");
+        emptyCameraState.classList.add("hidden");
+        scannerLine.classList.remove("hidden");
+        flipCameraBtn.classList.remove("hidden");
+        toggleCamText.textContent = "ปิดกล้องสด";
+        toggleCameraBtn.classList.replace("bg-cyan-600", "bg-rose-600");
+        isDetectingLive = true;
+        predictWebcam();
+        showToast("เปิดกล้อง + MQTT พร้อม");
+      } catch (err) {
+        showToast("ไม่อนุญาตกล้อง", "error");
+        stopCamera();
+      }
+    }
+
+    function stopCamera() {
+      isDetectingLive = false;
+      if (animationFrameId) cancelAnimationFrame(animationFrameId);
+      if (currentStream) currentStream.getTracks().forEach(t => t.stop());
+      currentStream = null;
+      webcam.classList.add("hidden");
+      scannerLine.classList.add("hidden");
+      emptyCameraState.classList.remove("hidden");
+      flipCameraBtn.classList.add("hidden");
+      ctx.clearRect(0, 0, canvasOverlay.width, canvasOverlay.height);
+      toggleCamText.textContent = "เปิดกล้องสด";
+      toggleCameraBtn.classList.replace("bg-rose-600", "bg-cyan-600");
+      forceSendOff();
+    }
+
+    async function processStaticImage(imageSource) {
+      if (runningMode !== "IMAGE") await initDetector("IMAGE");
+      stopCamera();
+      staticImage.classList.remove("hidden");
+      staticImage.onload = () => {
+        const t0 = performance.now();
+        const detections = objectDetector.detect(staticImage);
+        latencyDisplay.textContent = `${Math.round(performance.now() - t0)} ms`;
+        renderDetections(detections.detections, staticImage.naturalWidth, staticImage.naturalHeight);
+      };
+      if (typeof imageSource === "string") staticImage.src = imageSource;
+      else {
+        const reader = new FileReader();
+        reader.onload = (e) => { staticImage.src = e.target.result; };
+        reader.readAsDataURL(imageSource);
+      }
+    }
+
+    toggleCameraBtn.addEventListener("click", () => isDetectingLive ? stopCamera() : startCamera());
+    startCamPromptBtn.addEventListener("click", startCamera);
+    flipCameraBtn.addEventListener("click", () => { facingMode = facingMode === "user" ? "environment" : "user"; startCamera(); });
+    modeCameraBtn.addEventListener("click", () => {
+      modeCameraBtn.className = "flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold bg-cyan-600 text-white";
+      modeImageBtn.className = "flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold text-slate-400";
+      cameraControls.classList.remove("hidden");
+      imageControls.classList.add("hidden");
+      staticImage.classList.add("hidden");
+      if (!isDetectingLive) emptyCameraState.classList.remove("hidden");
+    });
+    modeImageBtn.addEventListener("click", () => {
+      modeImageBtn.className = "flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold bg-cyan-600 text-white";
+      modeCameraBtn.className = "flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold text-slate-400";
+      imageControls.classList.remove("hidden");
+      cameraControls.classList.add("hidden");
+      stopCamera();
+      emptyCameraState.classList.add("hidden");
+    });
+    imageFileInput.addEventListener("change", (e) => { if (e.target.files?.[0]) processStaticImage(e.target.files[0]); });
+    document.querySelectorAll(".preset-btn").forEach(btn => btn.addEventListener("click", () => processStaticImage(btn.dataset.src)));
+    thresholdSlider.addEventListener("input", (e) => { threshVal.textContent = `${e.target.value}%`; });
+    thresholdSlider.addEventListener("change", () => initDetector(runningMode));
+    maxResultsSlider.addEventListener("input", (e) => { maxVal.textContent = e.target.value; });
+    maxResultsSlider.addEventListener("change", () => initDetector(runningMode));
+    nearSlider.addEventListener("input", (e) => { nearVal.textContent = `${e.target.value}%`; });
+
+    window.addEventListener("DOMContentLoaded", () => {
+      setupMQTT();
+      initDetector("VIDEO");
+    });
+    window.addEventListener("beforeunload", () => forceSendOff());
+  </script>
+</body>
+</html>
