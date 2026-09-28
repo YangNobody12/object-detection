@@ -63,6 +63,7 @@
         const _params = new URLSearchParams(location.search);
         const WS_URL = _params.get("ws") || ((location.protocol === "https:" ? "wss:" : "ws:") + "//" + location.host + "/ws");
         const TRANSPORT = (_params.get("transport") || "auto").toLowerCase();
+        const WS_RESULT_TIMEOUT_MS = 20000;
         const PREDICT_URL = _params.get("predict") || "/api/predict";
         const CLIENT_ID = crypto.randomUUID?.() || ("c-" + Math.random().toString(36).slice(2));
 
@@ -98,6 +99,7 @@
         let inferActive = false, frameCounterActive = false, predictAwaiting = false, predictStartedAt = 0;
         let lastDet = null, lastSentState = null, lastSentTime = 0;
         let frameId = 0, renderFrames = 0, inferFrames = 0, inferMsSum = 0, statsStart = performance.now();
+        let lastInferAt = 0;
         const sendCanvas = document.createElement("canvas");
         const sendCtx = sendCanvas.getContext("2d");
 
@@ -135,9 +137,26 @@
                         setAiStatus("predict realtime (WebSocket)", "#4caf50");
                         ok();
                     } else if (msg.type === "result") handleResult(msg);
-                    else if (msg.type === "error") console.warn(msg.message);
+                    else if (msg.type === "error") {
+                        predictAwaiting = false;
+                        predictStartedAt = 0;
+                        setAiStatus("server: " + msg.message, "#ff3b30");
+                    }
                 };
             });
+        }
+
+        function switchToHttpPredict() {
+            if (transportMode === "http") return;
+            transportMode = "http";
+            try { ws?.close(); } catch (_) { }
+            ws = null;
+            predictAwaiting = false;
+            predictStartedAt = 0;
+            inferActive = false;
+            serverReady = true;
+            setAiStatus("ใช้ HTTP predict (WebSocket ไม่ส่งผล)", "#ffb300");
+            startLoops();
         }
 
         function syncCanvasSize() {
@@ -161,7 +180,7 @@
                 sendCtx.drawImage(video, 0, 0, sw, sh);
                 sendCanvas.toBlob((blob) => {
                     if (!blob) return reject(new Error("toBlob failed"));
-                    resolve({ blob, vw, vh, cw: canvas.width, ch: canvas.height });
+                    resolve({ blob, vw, vh, cw: canvas.width || sw, ch: canvas.height || sh });
                 }, "image/jpeg", PHONE ? 0.62 : 0.72);
             });
         }
@@ -219,19 +238,42 @@
             setAiStatus(`${(msg.yoloMs || 0).toFixed(0)} ms/ครั้ง (${transportMode})`, "#4caf50");
             inferFrames++;
             inferMsSum += msg.yoloMs || 0;
+            lastInferAt = Date.now();
         }
 
         async function wsLoop() {
             while (isRunning && ws?.readyState === WebSocket.OPEN) {
                 try {
-                    if (predictAwaiting) { await sleep(20); continue; }
+                    if (predictAwaiting) {
+                        if (predictStartedAt && Date.now() - predictStartedAt > WS_RESULT_TIMEOUT_MS) {
+                            predictAwaiting = false;
+                            switchToHttpPredict();
+                            return;
+                        }
+                        await sleep(20);
+                        continue;
+                    }
                     const cap = await captureFrame();
                     predictAwaiting = true;
+                    predictStartedAt = Date.now();
                     frameId++;
-                    const jpeg = await blobToBase64(cap.blob);
-                    ws.send(JSON.stringify({ type: "frame", id: frameId, jpeg, vw: cap.vw, vh: cap.vh, cw: cap.cw, ch: cap.ch }));
-                    await sleep(PHONE ? 150 : 80);
-                } catch (_) { predictAwaiting = false; await sleep(60); }
+                    const meta = {
+                        type: "frame",
+                        id: frameId,
+                        encoding: "binary",
+                        vw: cap.vw,
+                        vh: cap.vh,
+                        cw: cap.cw || cap.vw,
+                        ch: cap.ch || cap.vh
+                    };
+                    ws.send(JSON.stringify(meta));
+                    ws.send(cap.blob);
+                    await sleep(PHONE ? 150 : 100);
+                } catch (e) {
+                    predictAwaiting = false;
+                    setAiStatus(String(e.message || e), "#ff3b30");
+                    await sleep(300);
+                }
             }
             inferActive = false;
         }
@@ -336,7 +378,10 @@
             let text, color;
             if (currentLevel === LEVEL_NEAR) { text = "รถใกล้ → แดง"; color = COLOR_NEAR; }
             else if (currentLevel === LEVEL_FAR) { text = "รถไกล → เหลือง"; color = COLOR_FAR; }
-            else { text = "ไม่พบรถ → ดับ"; color = "#888"; }
+            else if (lastDet?.keep?.length) {
+                text = `ไม่พบรถ → ดับ (เจอวัตถุ ${lastDet.keep.length})`;
+                color = "#888";
+            } else { text = "ไม่พบรถ → ดับ"; color = "#888"; }
             const s = uiScale();
             ctx.font = `bold ${Math.round(16 * s)}px sans-serif`;
             const w = ctx.measureText(text).width;
@@ -362,6 +407,7 @@
             requestAnimationFrame(function loop() { if (isRunning) drawOverlay(); requestAnimationFrame(loop); });
             if (!inferActive && serverReady) {
                 inferActive = true;
+                lastInferAt = Date.now();
                 if (transportMode === "ws") wsLoop();
                 else httpLoop();
             }
@@ -373,6 +419,9 @@
             fpsDiv.innerText = `ภาพ ${Math.round(renderFrames / secs)} FPS | predict ${(inferFrames / secs).toFixed(1)}/วิ | ${transportMode}`;
             renderFrames = inferFrames = inferMsSum = 0;
             statsStart = performance.now();
+            if (isRunning && transportMode === "ws" && lastInferAt && Date.now() - lastInferAt > 12000) {
+                switchToHttpPredict();
+            }
         }, 1000);
 
         async function init() {

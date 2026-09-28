@@ -144,20 +144,43 @@ async def websocket_predict(ws: WebSocket):
             "nearThreshold": 0.35,
         }
     )
+    pending_meta: dict[str, Any] | None = None
     try:
         while True:
-            raw = await ws.receive_text()
-            msg = json.loads(raw)
-            if msg.get("type") != "frame" or not msg.get("jpeg"):
+            message = await ws.receive()
+            if message.get("type") == "websocket.disconnect":
+                break
+
+            if message.get("text") is not None:
+                msg = json.loads(message["text"])
+                if msg.get("type") != "frame":
+                    continue
+                if msg.get("encoding") == "binary":
+                    pending_meta = msg
+                    continue
+                if not msg.get("jpeg"):
+                    continue
+                jpeg = base64.b64decode(msg["jpeg"])
+                vw = int(msg.get("vw") or 0)
+                vh = int(msg.get("vh") or 0)
+                cw = int(msg.get("cw") or 0)
+                ch = int(msg.get("ch") or 0)
+                frame_id = int(msg.get("id") or 0)
+                result = await run_predict(jpeg, vw, vh, cw, ch, state)
+                await ws.send_json(result_payload(frame_id, result))
                 continue
-            jpeg = base64.b64decode(msg["jpeg"])
-            vw = int(msg.get("vw") or 0)
-            vh = int(msg.get("vh") or 0)
-            cw = int(msg.get("cw") or 0)
-            ch = int(msg.get("ch") or 0)
-            frame_id = int(msg.get("id") or 0)
-            result = await run_predict(jpeg, vw, vh, cw, ch, state)
-            await ws.send_json(result_payload(frame_id, result))
+
+            if message.get("bytes") is not None and pending_meta:
+                msg = pending_meta
+                pending_meta = None
+                jpeg = message["bytes"]
+                vw = int(msg.get("vw") or 0)
+                vh = int(msg.get("vh") or 0)
+                cw = int(msg.get("cw") or 0)
+                ch = int(msg.get("ch") or 0)
+                frame_id = int(msg.get("id") or 0)
+                result = await run_predict(jpeg, vw, vh, cw, ch, state)
+                await ws.send_json(result_payload(frame_id, result))
     except WebSocketDisconnect:
         pass
     except Exception as e:

@@ -27,7 +27,7 @@ LEVEL_NONE = 0
 LEVEL_FAR = 1
 LEVEL_NEAR = 2
 
-SERVER_BUILD = "2026-09-28-fastapi-yolo"
+SERVER_BUILD = "2026-09-28-fastapi-yolo2"
 
 
 def clamp(v: float, a: float, b: float) -> float:
@@ -245,15 +245,16 @@ class VisionEngine:
         out = outputs[0]
         det = self.decode_yolo(out, list(out.shape), lb, cw, ch)
         level = self.compute_level(det, cw, ch, state)
+        closeness = {str(k): float(v) for k, v in (det.get("closeness") or {}).items()}
         return {
-            "level": level,
-            "bestScore": det.get("bestScore") or 0,
-            "yoloMs": round(yolo_ms, 1),
+            "level": int(level),
+            "bestScore": float(det.get("bestScore") or 0),
+            "yoloMs": round(float(yolo_ms), 1),
             "det": {
-                "boxes": det["boxes"],
-                "scores": det["scores"],
-                "classIds": det["classIds"],
-                "keep": det["keep"],
-                "closeness": det["closeness"],
+                "boxes": [[float(x) for x in b] for b in det["boxes"]],
+                "scores": [float(s) for s in det["scores"]],
+                "classIds": [int(c) for c in det["classIds"]],
+                "keep": [int(i) for i in det["keep"]],
+                "closeness": closeness,
             },
         }
