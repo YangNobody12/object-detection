@@ -1,9 +1,12 @@
 __pycache__/
+*.py[cod]
 .venv/
 venv/
 .env
+.envrc
 .DS_Store
 Thumbs.db
 .render-cli/
+__pycache__/
 
-# Keep model.onnx in git for Render deploy (~5 MB)
+# model.onnx is tracked for Render (~5 MB)
