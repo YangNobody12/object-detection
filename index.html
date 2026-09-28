@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="th">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+    <title>YOLO + FastAPI + HiveMQ</title>
+    <script src="https://unpkg.com/mqtt@5.16.0/dist/mqtt.min.js"></script>
+    <style>
+        :root { --bg-color: #121212; --accent-color: #00d1b2; --text-color: #fff; }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: var(--bg-color); color: var(--text-color);
+            min-height: 100vh; display: flex; flex-direction: column; align-items: center; padding: 12px;
+        }
+        header { text-align: center; margin-bottom: 12px; }
+        h1 { font-size: 1.25rem; color: var(--accent-color); margin-bottom: 4px; }
+        #status { font-size: 0.85rem; color: #aaa; font-weight: 500; }
+        .substatus { font-size: 0.8rem; margin-top: 2px; color: #aaa; }
+        .viewport {
+            position: relative; width: 100%; max-width: 480px; aspect-ratio: 1/1;
+            border-radius: 12px; overflow: hidden; background: #000;
+            box-shadow: 0 4px 20px rgba(0,0,0,.6);
+        }
+        #webcam { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; z-index: 0; }
+        #output-canvas { position: absolute; inset: 0; z-index: 1; width: 100%; height: 100%; object-fit: contain; }
+        .footer-bar {
+            margin-top: 14px; width: 100%; max-width: 480px;
+            display: flex; justify-content: space-between; align-items: center; font-size: 0.8rem; color: #777;
+        }
+        #fps-display { text-align: right; }
+        .btn { padding: 8px 16px; background: #333; color: #fff; border: none; border-radius: 6px; cursor: pointer; }
+    </style>
+</head>
+
+<body>
+    <header>
+        <h1>ระบบตรวจจับรถ</h1>
+        <div id="status">กำลังเริ่มต้น...</div>
+        <div id="ai-status" class="substatus">AI: รอเชื่อมต่อ FastAPI</div>
+        <div id="mqtt-status" class="substatus">MQTT: กำลังเชื่อมต่อ...</div>
+    </header>
+    <div class="viewport">
+        <video id="webcam" autoplay playsinline muted></video>
+        <canvas id="output-canvas"></canvas>
+    </div>
+    <div class="footer-bar">
+        <button id="cam-btn" class="btn" disabled>เปิดกล้อง</button>
+        <div id="fps-display">FPS: 0</div>
+    </div>
+
+    <script>
+        const MQTT_HOST = "wss://5b44b6c6c4ef4b65a63422825cfa4e4d.s1.eu.hivemq.cloud:8884/mqtt";
+        const MQTT_USER = "obecject detection";
+        const MQTT_PASS = "obecject123";
+        const MQTT_TOPIC = "led/control";
+        const MQTT_PAYLOAD_NEAR = "RED";
+        const MQTT_PAYLOAD_FAR = "YELLOW";
+        const MQTT_PAYLOAD_OFF = "OFF";
+
+        const _params = new URLSearchParams(location.search);
+        const WS_URL = _params.get("ws") || ((location.protocol === "https:" ? "wss:" : "ws:") + "//" + location.host + "/ws");
+        const TRANSPORT = (_params.get("transport") || "auto").toLowerCase();
+        const PREDICT_URL = _params.get("predict") || "/api/predict";
+        const CLIENT_ID = crypto.randomUUID?.() || ("c-" + Math.random().toString(36).slice(2));
+
+        const NEAR_RATIO = 0.35;
+        const VEHICLE_CLASSES = [1, 2, 3, 5, 6, 7];
+        const COCO_CLASSES = [
+            'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat', 'traffic light',
+            'fire hydrant', 'stop sign', 'parking meter', 'bench', 'bird', 'cat', 'dog', 'horse', 'sheep', 'cow',
+            'elephant', 'bear', 'zebra', 'giraffe', 'backpack', 'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee',
+            'skis', 'snowboard', 'sports ball', 'kite', 'baseball bat', 'baseball glove', 'skateboard', 'surfboard',
+            'tennis racket', 'bottle', 'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple',
+            'sandwich', 'orange', 'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair', 'couch',
+            'potted plant', 'bed', 'dining table', 'toilet', 'tv', 'laptop', 'mouse', 'remote', 'keyboard', 'cell phone',
+            'microwave', 'oven', 'toaster', 'sink', 'refrigerator', 'book', 'clock', 'vase', 'scissors', 'teddy bear',
+            'hair drier', 'toothbrush'
+        ];
+        const COLOR_NEAR = "#ff3b30", COLOR_FAR = "#ffc107", COLOR_OTHER = "#00d1b2";
+        const LEVEL_NONE = 0, LEVEL_FAR = 1, LEVEL_NEAR = 2;
+        const PHONE = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
+            || (navigator.maxTouchPoints > 1 && matchMedia("(pointer: coarse)").matches);
+
+        const video = document.getElementById("webcam");
+        const canvas = document.getElementById("output-canvas");
+        const ctx = canvas.getContext("2d");
+        const statusDiv = document.getElementById("status");
+        const aiDiv = document.getElementById("ai-status");
+        const mqttDiv = document.getElementById("mqtt-status");
+        const fpsDiv = document.getElementById("fps-display");
+        const camBtn = document.getElementById("cam-btn");
+
+        let mqttClient, ws = null, serverReady = false, transportMode = "http";
+        let lastBestScore = 0, currentLevel = LEVEL_NONE, isRunning = false;
+        let inferActive = false, frameCounterActive = false, predictAwaiting = false, predictStartedAt = 0;
+        let lastDet = null, lastSentState = null, lastSentTime = 0;
+        let frameId = 0, renderFrames = 0, inferFrames = 0, inferMsSum = 0, statsStart = performance.now();
+        const sendCanvas = document.createElement("canvas");
+        const sendCtx = sendCanvas.getContext("2d");
+
+        const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+        const setStatus = (t, c) => { statusDiv.innerText = t; if (c) statusDiv.style.color = c; };
+        const setAiStatus = (t, c) => { aiDiv.innerText = "AI: " + t; aiDiv.style.color = c || "#aaa"; };
+        const setMqttStatus = (t, c) => { mqttDiv.innerText = "MQTT: " + t; mqttDiv.style.color = c || "#aaa"; };
+
+        async function probeHealth() {
+            for (const path of ["/health", "/api/health"]) {
+                try {
+                    const r = await fetch(path, { cache: "no-store" });
+                    if (r.ok) return { ok: true, data: await r.json() };
+                } catch (_) { }
+            }
+            return { ok: false };
+        }
+
+        function connectWs() {
+            return new Promise((resolve, reject) => {
+                let settled = false;
+                const fail = (e) => { if (!settled) { settled = true; clearTimeout(timer); reject(e); } };
+                const ok = () => { if (!settled) { settled = true; clearTimeout(timer); resolve(); } };
+                const timer = setTimeout(() => fail(new Error("WebSocket timeout")), PHONE ? 4000 : 12000);
+                const socket = new WebSocket(WS_URL);
+                socket.onerror = () => fail(new Error("WebSocket error"));
+                socket.onclose = (ev) => {
+                    if (!settled) fail(new Error("WebSocket closed " + ev.code));
+                    else { serverReady = false; ws = null; }
+                };
+                socket.onmessage = (ev) => {
+                    let msg; try { msg = JSON.parse(ev.data); } catch { return; }
+                    if (msg.type === "ready") {
+                        ws = socket; serverReady = true; transportMode = "ws";
+                        setAiStatus("predict realtime (WebSocket)", "#4caf50");
+                        ok();
+                    } else if (msg.type === "result") handleResult(msg);
+                    else if (msg.type === "error") console.warn(msg.message);
+                };
+            });
+        }
+
+        function syncCanvasSize() {
+            const vw = video.videoWidth, vh = video.videoHeight;
+            if (!vw || !vh) return;
+            const maxSide = PHONE ? 640 : 960;
+            const scale = Math.min(1, maxSide / Math.max(vw, vh));
+            const w = Math.max(1, Math.round(vw * scale)), h = Math.max(1, Math.round(vh * scale));
+            if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+        }
+
+        function captureFrame() {
+            return new Promise((resolve, reject) => {
+                const vw = video.videoWidth, vh = video.videoHeight;
+                if (!vw || !vh) return reject(new Error("กล้องยังไม่พร้อม"));
+                syncCanvasSize();
+                const maxSide = PHONE ? 480 : 640;
+                const scale = Math.min(1, maxSide / Math.max(vw, vh));
+                const sw = Math.max(1, Math.round(vw * scale)), sh = Math.max(1, Math.round(vh * scale));
+                sendCanvas.width = sw; sendCanvas.height = sh;
+                sendCtx.drawImage(video, 0, 0, sw, sh);
+                sendCanvas.toBlob((blob) => {
+                    if (!blob) return reject(new Error("toBlob failed"));
+                    resolve({ blob, vw, vh, cw: canvas.width, ch: canvas.height });
+                }, "image/jpeg", PHONE ? 0.62 : 0.72);
+            });
+        }
+
+        async function blobToBase64(blob) {
+            return new Promise((resolve, reject) => {
+                const fr = new FileReader();
+                fr.onload = () => resolve(String(fr.result).split(",")[1]);
+                fr.onerror = () => reject(new Error("read blob failed"));
+                fr.readAsDataURL(blob);
+            });
+        }
+
+        async function postPredict(capture) {
+            frameId++;
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), 90000);
+            try {
+                const r = await fetch(PREDICT_URL, {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "image/jpeg",
+                        "X-Client-Id": CLIENT_ID,
+                        "X-Frame-Id": String(frameId),
+                        "X-VW": String(capture.vw),
+                        "X-VH": String(capture.vh),
+                        "X-CW": String(capture.cw),
+                        "X-CH": String(capture.ch)
+                    },
+                    body: capture.blob,
+                    signal: ctrl.signal,
+                    cache: "no-store"
+                });
+                const text = await r.text();
+                let msg; try { msg = JSON.parse(text); } catch { throw new Error("invalid JSON " + r.status); }
+                if (!r.ok || msg.type === "error") throw new Error(msg.message || "HTTP " + r.status);
+                return msg;
+            } finally { clearTimeout(timer); }
+        }
+
+        function handleResult(msg) {
+            predictAwaiting = false;
+            predictStartedAt = 0;
+            lastDet = {
+                boxes: msg.det.boxes,
+                scores: msg.det.scores,
+                classIds: msg.det.classIds,
+                keep: msg.det.keep,
+                closeness: msg.det.closeness || {}
+            };
+            lastBestScore = msg.bestScore || 0;
+            currentLevel = msg.level;
+            sendMqttAlert(currentLevel);
+            drawOverlay();
+            setAiStatus(`${(msg.yoloMs || 0).toFixed(0)} ms/ครั้ง (${transportMode})`, "#4caf50");
+            inferFrames++;
+            inferMsSum += msg.yoloMs || 0;
+        }
+
+        async function wsLoop() {
+            while (isRunning && ws?.readyState === WebSocket.OPEN) {
+                try {
+                    if (predictAwaiting) { await sleep(20); continue; }
+                    const cap = await captureFrame();
+                    predictAwaiting = true;
+                    frameId++;
+                    const jpeg = await blobToBase64(cap.blob);
+                    ws.send(JSON.stringify({ type: "frame", id: frameId, jpeg, vw: cap.vw, vh: cap.vh, cw: cap.cw, ch: cap.ch }));
+                    await sleep(PHONE ? 150 : 80);
+                } catch (_) { predictAwaiting = false; await sleep(60); }
+            }
+            inferActive = false;
+        }
+
+        async function httpLoop() {
+            try {
+                while (isRunning && serverReady && transportMode === "http") {
+                    try {
+                        if (predictAwaiting) {
+                            if (predictStartedAt && Date.now() - predictStartedAt > 95000) {
+                                predictAwaiting = false;
+                                throw new Error("timeout");
+                            }
+                            await sleep(30);
+                            continue;
+                        }
+                        const cap = await captureFrame();
+                        predictAwaiting = true;
+                        predictStartedAt = Date.now();
+                        setAiStatus("กำลัง predict...", "#aaa");
+                        handleResult(await postPredict(cap));
+                        await sleep(PHONE ? 250 : 150);
+                    } catch (e) {
+                        predictAwaiting = false;
+                        setAiStatus(String(e.message || e), "#ff3b30");
+                        await sleep(800);
+                    }
+                }
+            } finally { inferActive = false; }
+        }
+
+        function setupMQTT() {
+            mqttClient = mqtt.connect(MQTT_HOST, {
+                username: MQTT_USER, password: MQTT_PASS, protocolVersion: 5,
+                keepalive: 60, clean: true, reconnectPeriod: 3000, connectTimeout: 10000,
+                will: { topic: MQTT_TOPIC, payload: MQTT_PAYLOAD_OFF, qos: 0, retain: true }
+            });
+            mqttClient.on("connect", () => { setMqttStatus("เชื่อมต่อแล้ว ✓", "#4caf50"); lastSentState = null; });
+            mqttClient.on("error", (e) => setMqttStatus(String(e.message || e), "#ff3b30"));
+        }
+
+        function sendMqttAlert(level) {
+            const payload = level === LEVEL_NEAR ? MQTT_PAYLOAD_NEAR : level === LEVEL_FAR ? MQTT_PAYLOAD_FAR : MQTT_PAYLOAD_OFF;
+            const now = Date.now();
+            if (payload !== lastSentState && now - lastSentTime > 800) {
+                mqttClient?.publish(MQTT_TOPIC, payload, { qos: 0, retain: true });
+                lastSentState = payload;
+                lastSentTime = now;
+            }
+        }
+
+        function forceSendOff() {
+            currentLevel = LEVEL_NONE;
+            mqttClient?.publish(MQTT_TOPIC, MQTT_PAYLOAD_OFF, { qos: 0, retain: true });
+        }
+
+        async function startCamera() {
+            const stream = await navigator.mediaDevices.getUserMedia({
+                video: PHONE
+                    ? { facingMode: { ideal: "environment" }, width: { ideal: 640 }, height: { ideal: 480 } }
+                    : { facingMode: { ideal: "environment" }, width: { ideal: 640 }, height: { ideal: 480 } },
+                audio: false
+            });
+            video.srcObject = stream;
+            video.muted = true;
+            video.playsInline = true;
+            await video.play().catch(() => { });
+            await new Promise((res) => {
+                if (video.videoWidth > 0) { syncCanvasSize(); res(); return; }
+                video.onloadedmetadata = () => { syncCanvasSize(); res(); };
+                setTimeout(res, 1200);
+            });
+        }
+
+        function uiScale() { return Math.max(1, Math.max(canvas.width, canvas.height) / 640); }
+
+        function drawDetections(det) {
+            const s = uiScale();
+            ctx.lineWidth = 3 * s;
+            ctx.font = `bold ${Math.round(16 * s)}px sans-serif`;
+            for (const i of det.keep) {
+                const [x1, y1, x2, y2] = det.boxes[i];
+                const cid = det.classIds[i];
+                let color = COLOR_OTHER, extra = "";
+                if (VEHICLE_CLASSES.includes(cid)) {
+                    const c = det.closeness[i] ?? det.closeness[String(i)] ?? 0;
+                    color = c >= NEAR_RATIO ? COLOR_NEAR : COLOR_FAR;
+                    extra = ` | ${Math.round(c * 100)}%`;
+                }
+                ctx.strokeStyle = color;
+                ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+                const label = `${COCO_CLASSES[cid] || "obj"}: ${(det.scores[i] * 100).toFixed(0)}%${extra}`;
+                const tw = ctx.measureText(label).width, lh = 22 * s, ly = y1 >= lh ? y1 - lh : y1;
+                ctx.fillStyle = color;
+                ctx.fillRect(x1, ly, tw + 8 * s, lh);
+                ctx.fillStyle = color === COLOR_FAR ? "#000" : "#fff";
+                ctx.fillText(label, x1 + 4 * s, ly + 3 * s);
+            }
+        }
+
+        function drawHud() {
+            let text, color;
+            if (currentLevel === LEVEL_NEAR) { text = "รถใกล้ → แดง"; color = COLOR_NEAR; }
+            else if (currentLevel === LEVEL_FAR) { text = "รถไกล → เหลือง"; color = COLOR_FAR; }
+            else { text = "ไม่พบรถ → ดับ"; color = "#888"; }
+            const s = uiScale();
+            ctx.font = `bold ${Math.round(16 * s)}px sans-serif`;
+            const w = ctx.measureText(text).width;
+            ctx.fillStyle = "rgba(0,0,0,.6)";
+            ctx.fillRect(8 * s, 8 * s, w + 24 * s, 28 * s);
+            ctx.fillStyle = color;
+            ctx.fillText(text, 16 * s, 28 * s);
+        }
+
+        function drawOverlay() {
+            syncCanvasSize();
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            if (lastDet) drawDetections(lastDet);
+            drawHud();
+        }
+
+        function startLoops() {
+            if (!frameCounterActive && video.requestVideoFrameCallback) {
+                frameCounterActive = true;
+                const tick = () => { renderFrames++; video.requestVideoFrameCallback(tick); };
+                video.requestVideoFrameCallback(tick);
+            }
+            requestAnimationFrame(function loop() { if (isRunning) drawOverlay(); requestAnimationFrame(loop); });
+            if (!inferActive && serverReady) {
+                inferActive = true;
+                if (transportMode === "ws") wsLoop();
+                else httpLoop();
+            }
+        }
+
+        setInterval(() => {
+            const secs = (performance.now() - statsStart) / 1000;
+            if (secs <= 0) return;
+            fpsDiv.innerText = `ภาพ ${Math.round(renderFrames / secs)} FPS | predict ${(inferFrames / secs).toFixed(1)}/วิ | ${transportMode}`;
+            renderFrames = inferFrames = inferMsSum = 0;
+            statsStart = performance.now();
+        }, 1000);
+
+        async function init() {
+            try {
+                if (location.protocol === "file:") throw new Error("เปิดผ่าน uvicorn ไม่ใช่ file://");
+                setupMQTT();
+                setAiStatus("ตรวจ /health...", "#aaa");
+                const probe = await probeHealth();
+                if (!probe.ok) throw new Error("ไม่พบ FastAPI — รัน: uvicorn server:app --reload");
+
+                if (TRANSPORT === "http") {
+                    serverReady = true;
+                    transportMode = "http";
+                    setAiStatus("predict (HTTP)", "#ffb300");
+                } else {
+                    try {
+                        await connectWs();
+                    } catch (e) {
+                        if (TRANSPORT === "ws") throw e;
+                        serverReady = true;
+                        transportMode = "http";
+                        setAiStatus("WebSocket ไม่ได้ → ใช้ HTTP", "#ffb300");
+                    }
+                }
+
+                setStatus("เปิดกล้อง...", "#aaa");
+                await startCamera();
+                isRunning = true;
+                camBtn.disabled = false;
+                camBtn.innerText = "ปิดกล้อง";
+                setStatus("พร้อม — predict บน FastAPI", "#4caf50");
+                startLoops();
+            } catch (e) {
+                setStatus("Error: " + e.message, "#ff3b30");
+            }
+        }
+
+        camBtn.addEventListener("click", async () => {
+            if (!serverReady) return;
+            isRunning = !isRunning;
+            if (isRunning) {
+                await startCamera();
+                camBtn.innerText = "ปิดกล้อง";
+                startLoops();
+            } else {
+                forceSendOff();
+                video.srcObject?.getTracks?.().forEach(t => t.stop());
+                camBtn.innerText = "เปิดกล้อง";
+            }
+        });
+
+        window.addEventListener("DOMContentLoaded", init);
+    </script>
+</body>
+
+</html>

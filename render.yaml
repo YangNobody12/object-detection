@@ -1,0 +1,12 @@
+# Render Blueprint — https://render.com/docs/infrastructure-as-code
+services:
+  - type: web
+    name: mini-project-vision
+    runtime: python
+    plan: free
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.5"

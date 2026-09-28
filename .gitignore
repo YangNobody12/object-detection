@@ -1,0 +1,9 @@
+__pycache__/
+.venv/
+venv/
+.env
+.DS_Store
+Thumbs.db
+.render-cli/
+
+# Keep model.onnx in git for Render deploy (~5 MB)
