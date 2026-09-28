@@ -131,6 +131,19 @@ async def predict_http(request: Request):
         return JSONResponse({"type": "error", "message": str(e)}, status_code=500)
 
 
+async def _predict_and_send(ws: WebSocket, state: ClientState, meta: dict[str, Any], jpeg: bytes) -> None:
+    frame_id = int(meta.get("id") or 0)
+    result = await run_predict(
+        jpeg,
+        int(meta.get("vw") or 0),
+        int(meta.get("vh") or 0),
+        int(meta.get("cw") or 0),
+        int(meta.get("ch") or 0),
+        state,
+    )
+    await ws.send_json(result_payload(frame_id, result))
+
+
 @app.websocket("/ws")
 async def websocket_predict(ws: WebSocket):
     await ws.accept()
@@ -142,8 +155,33 @@ async def websocket_predict(ws: WebSocket):
             "depth": False,
             "depthSize": [0, 0],
             "nearThreshold": 0.35,
+            "realtime": True,
         }
     )
+
+    latest_meta: dict[str, Any] | None = None
+    latest_jpeg: bytes | None = None
+    processing = False
+
+    async def drain_latest() -> None:
+        nonlocal processing, latest_meta, latest_jpeg
+        if processing:
+            return
+        processing = True
+        try:
+            while latest_meta is not None and latest_jpeg is not None:
+                meta, jpeg = latest_meta, latest_jpeg
+                latest_meta = None
+                latest_jpeg = None
+                try:
+                    await _predict_and_send(ws, state, meta, jpeg)
+                except Exception as err:
+                    await ws.send_json({"type": "error", "message": str(err)})
+        finally:
+            processing = False
+            if latest_meta is not None and latest_jpeg is not None:
+                asyncio.create_task(drain_latest())
+
     pending_meta: dict[str, Any] | None = None
     try:
         while True:
@@ -160,27 +198,16 @@ async def websocket_predict(ws: WebSocket):
                     continue
                 if not msg.get("jpeg"):
                     continue
-                jpeg = base64.b64decode(msg["jpeg"])
-                vw = int(msg.get("vw") or 0)
-                vh = int(msg.get("vh") or 0)
-                cw = int(msg.get("cw") or 0)
-                ch = int(msg.get("ch") or 0)
-                frame_id = int(msg.get("id") or 0)
-                result = await run_predict(jpeg, vw, vh, cw, ch, state)
-                await ws.send_json(result_payload(frame_id, result))
+                latest_meta = msg
+                latest_jpeg = base64.b64decode(msg["jpeg"])
+                await drain_latest()
                 continue
 
             if message.get("bytes") is not None and pending_meta:
-                msg = pending_meta
+                latest_meta = pending_meta
+                latest_jpeg = message["bytes"]
                 pending_meta = None
-                jpeg = message["bytes"]
-                vw = int(msg.get("vw") or 0)
-                vh = int(msg.get("vh") or 0)
-                cw = int(msg.get("cw") or 0)
-                ch = int(msg.get("ch") or 0)
-                frame_id = int(msg.get("id") or 0)
-                result = await run_predict(jpeg, vw, vh, cw, ch, state)
-                await ws.send_json(result_payload(frame_id, result))
+                await drain_latest()
     except WebSocketDisconnect:
         pass
     except Exception as e:

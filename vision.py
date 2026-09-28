@@ -27,7 +27,7 @@ LEVEL_NONE = 0
 LEVEL_FAR = 1
 LEVEL_NEAR = 2
 
-SERVER_BUILD = "2026-09-28-fastapi-yolo2"
+SERVER_BUILD = "2026-09-28-realtime"
 
 
 def clamp(v: float, a: float, b: float) -> float:
@@ -77,11 +77,21 @@ class VisionEngine:
     def load(cls) -> "VisionEngine":
         if not YOLO_PATH.is_file():
             raise FileNotFoundError(f"ไม่พบ {YOLO_PATH}")
+        opts = ort.SessionOptions()
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        opts.intra_op_num_threads = 2
+        opts.inter_op_num_threads = 1
         session = ort.InferenceSession(
             str(YOLO_PATH),
+            opts,
             providers=["CPUExecutionProvider"],
         )
-        return cls(session)
+        engine = cls(session)
+        # warmup — ลด latency เฟรมแรกบน Render
+        buf = io.BytesIO()
+        Image.new("RGB", (640, 480), (114, 114, 114)).save(buf, format="JPEG")
+        engine.process_frame(buf.getvalue(), 640, 480, 640, 480, ClientState())
+        return engine
 
     def letterbox(self, jpeg: bytes, vw: int, vh: int, cw: int) -> tuple[np.ndarray, dict[str, float]]:
         img = Image.open(io.BytesIO(jpeg)).convert("RGB")
